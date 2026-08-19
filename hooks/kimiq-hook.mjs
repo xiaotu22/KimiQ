@@ -86,17 +86,17 @@ function summarize(raw) {
       case 'TodoList': {
         const todos = inp.todos || [];
         const i = todos.findIndex((t) => t.status === 'in_progress');
-        return i >= 0 ? `任务 ${i + 1}/${todos.length} · ${cut(todos[i].title, 18)}` : '';
+        return i >= 0 ? `${i + 1}/${todos.length} · ${cut(todos[i].title, 12)}` : '';
       }
-      case 'Read': return `读 ${cut(base(inp.file_path || inp.path), 18)}`;
-      case 'Edit': return `改 ${cut(base(inp.file_path || inp.path), 18)}`;
-      case 'Write': return `写 ${cut(base(inp.file_path || inp.path), 18)}`;
-      case 'Grep': return `检索 ${cut(inp.pattern, 16)}`;
-      case 'Glob': return `找 ${cut(inp.pattern, 16)}`;
-      case 'Bash': return `跑 ${cut(inp.command, 20)}`;
-      case 'WebSearch': return `搜 ${cut(inp.query, 16)}`;
-      case 'FetchURL': return `看 ${cut(inp.url, 20)}`;
-      case 'Agent': case 'AgentSwarm': return `派分身 · ${cut(inp.description, 12)}`;
+      case 'Read': return `读 ${cut(base(inp.file_path || inp.path), 14)}`;
+      case 'Edit': return `改 ${cut(base(inp.file_path || inp.path), 14)}`;
+      case 'Write': return `写 ${cut(base(inp.file_path || inp.path), 14)}`;
+      case 'Grep': return `检索 ${cut(inp.pattern, 12)}`;
+      case 'Glob': return `找 ${cut(inp.pattern, 12)}`;
+      case 'Bash': return `跑 ${cut(inp.command, 12)}`;
+      case 'WebSearch': return `搜 ${cut(inp.query, 12)}`;
+      case 'FetchURL': return `看 ${cut(inp.url, 14)}`;
+      case 'Agent': case 'AgentSwarm': return `派分身 · ${cut(inp.description, 8)}`;
       default: return '';
     }
   } catch { return ''; }

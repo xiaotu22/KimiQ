@@ -53,12 +53,25 @@
     border: 4px solid transparent; border-top-color: rgba(255, 255, 255, 0.94);
     border-bottom: none;
   }
+  /* 任务气泡：状态气泡下面那条，专门显示"Kimi 正在干什么"（极简、常驻到下个任务） */
+  #taskbubble {
+    display: none; position: fixed; left: 50%; top: 30px;
+    transform: translateX(-50%);
+    font: 10px/1.4 "Microsoft YaHei", sans-serif; color: #3a4a5a;
+    background: rgba(232, 240, 248, 0.94); border-radius: 8px;
+    padding: 2px 8px; pointer-events: none;
+    max-width: 118px; text-align: center;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    z-index: 9; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  }
+  #taskbubble.on { display: block; }
 </style>
 </head>
 <body>
 <div id="stage"></div>
 <div id="label"></div>
 <div id="bubble"></div>
+<div id="taskbubble"></div>
 <div id="hint">←/→ 或点两侧翻页 · 空格 停/启巡演 · 点中间甩彩带</div>
 
 <!-- Qt WebChannel 桥（拖拽移动窗口用，qrc 由 QtWebEngine 内置提供） -->
@@ -138,10 +151,12 @@
     setMini: function (on) {
       miniMode = !!on;
       refreshBubble();
+      refreshTask();
     },
-    /* 气泡模式：auto 状态变化自动浮现 / hover 仅悬停 / off 关闭 */
+    /* 气泡模式：auto 状态变化自动浮现 / always 常驻状态栏 / hover 仅悬停 / off 关闭 */
     setBubbleMode: function (m) {
-      bubbleMode = (m === 'auto' || m === 'off') ? m : 'hover';
+      if (['auto', 'always', 'hover', 'off'].indexOf(m) < 0) m = 'hover';
+      bubbleMode = m;
       refreshBubble();
     },
     /* 气泡位置：top 球顶 / side 球右侧（命中 mask 由 Python 侧同步） */
@@ -160,6 +175,17 @@
       }, (sec || 3) * 1000);
       refreshBubble();
     },
+    /* 任务气泡：显示当前任务文本（空串=收起），与状态气泡相互独立 */
+    setTask: function (text) {
+      taskText = String(text || '');
+      taskBubble.textContent = taskText;
+      refreshTask();
+    },
+    /* 任务气泡开关（右键/设置调） */
+    setTaskBubble: function (on) {
+      taskOn = !!on;
+      refreshTask();
+    },
     /* 球显示大小（窗口固定 320 不动，只缩放球体）。
        基准：窗口 320px 时球自然直径 ≈ 282px（viewBox 259 宽，球占 228.45） */
     setBallSize: function (px) {
@@ -167,6 +193,7 @@
       stage.style.transformOrigin = 'center center';
       ballPx = px;
       placeBubble();
+      placeBabies();
     },
     /* 换身体形状：blob 圆胖 / wedge 三角 / gem 菱形（引擎原生，需重建实例） */
     setShape: function (shape) {
@@ -184,59 +211,91 @@
       sketchOn = !!on;
       main.setStyle({ sketch: sketchOn ? 1 : 0 });
     },
-    /* 子代理小球：最多 2 只，26px 缩在大球左/右上角外侧（别骑脸） */
+    /* 子代理小球：最多 2 只，26px，趴在主球左下/右下侧玩（要在 mask 范围内） */
     addBaby: function () {
       if (babies.length >= 2) return babies.length;
       var el = document.createElement('div');
-      el.style.cssText = 'position:fixed;top:0;width:26px;height:26px;pointer-events:none;'
-        + (babies.length === 0 ? 'left:0;' : 'right:0;') + 'z-index:5';
+      el.style.cssText = 'position:fixed;width:26px;height:26px;pointer-events:none;z-index:5';
       document.body.appendChild(el);
       var eng = EmotionBall.create(el, {
         emotion: '32', lite: true, eyeScale: 1.7, label: 'Kimi 子代理'
       });
       babies.push({ el: el, eng: eng });
+      placeBabies();
       return babies.length;
     },
     removeBaby: function () {
       var b = babies.pop();
-      if (b) { b.eng.destroy(); b.el.remove(); }
+      if (b) { b.eng.destroy(); b.el.remove(); placeBabies(); }
       return babies.length;
     }
   };
 
   /* ---------------- 悬停气泡 + 睡眠惊醒 + hover 上报（mini 探出用） ---------------- */
   var bubble = document.getElementById('bubble');
+  var taskBubble = document.getElementById('taskbubble');
   var statusText = 'Kimi：待命中';
+  var taskText = '';
+  var taskOn = false;   /* 页面加载后由 Python 同步为设置值 */
   var hovering = false;
   var ballPx = 120;   /* 与 Python CONF 默认 size 一致，apply_size 后同步 */
   var bubbleMode = 'hover';   /* 页面加载后由 Python 同步为设置值 */
   var bubblePos = 'top';
   var flashOn = false, flashTimer = 0;
 
-  /* 气泡贴球：top=球顶上方（34≈两行气泡高+小尾巴+间隙，大球贴不下退到窗口顶）；
-     side=球右侧垂直居中，宽度随剩余空间收窄 */
+  /* 气泡贴球：top=两条气泡整体悬在球头顶上方（状态在上、任务紧贴其下，
+     任务条底边离球顶留 4px）；side=球右侧垂直居中，宽度随剩余空间收窄 */
   function placeBubble() {
     if (bubblePos === 'side') {
       var left = 160 + ballPx / 2 + 8;
+      var mw = Math.max(56, 320 - left - 6);
       bubble.style.left = left + 'px';
-      bubble.style.top = '146px';
+      bubble.style.top = '140px';
       bubble.style.transform = 'none';
-      bubble.style.maxWidth = Math.max(56, 320 - left - 6) + 'px';
+      bubble.style.maxWidth = mw + 'px';
+      taskBubble.style.left = left + 'px';
+      taskBubble.style.top = '170px';
+      taskBubble.style.transform = 'none';
+      taskBubble.style.maxWidth = mw + 'px';
     } else {
       bubble.style.left = '50%';
       bubble.style.transform = 'translateX(-50%)';
       bubble.style.maxWidth = '108px';
       var ballTop = (320 - ballPx) / 2;
-      bubble.style.top = Math.max(2, ballTop - 34) + 'px';
+      var taskTop = Math.max(24, ballTop - 22);    /* 任务条底 ≈ 球顶 -4px */
+      bubble.style.top = Math.max(2, taskTop - 30) + 'px';
+      taskBubble.style.left = '50%';
+      taskBubble.style.transform = 'translateX(-50%)';
+      taskBubble.style.top = taskTop + 'px';
     }
   }
   placeBubble();
 
+  /* 子代理小球落位：第一只趴球左下侧，第二只右下侧（跟球径走） */
+  function placeBabies() {
+    var top = 160 + ballPx / 2 - 4;
+    babies.forEach(function (b, i) {
+      b.el.style.top = top + 'px';
+      b.el.style.left = (i === 0 ? (160 - ballPx / 2 - 30)
+                                 : (160 + ballPx / 2 + 4)) + 'px';
+    });
+  }
+
+  function refreshTask() {
+    /* 任务气泡：开关开着且有任务文本才显示；图鉴/mini 下让位 */
+    taskBubble.classList.toggle('on', taskOn && !!taskText && !GALLERY && !miniMode);
+  }
+
   function refreshBubble() {
-    /* off 永不显示；hover 只认悬停；auto 悬停或 Python 触发的短暂浮现都算。
-       拖拽/摸头/图鉴/mini 下一律不显示 */
+    /* off 永不显示；always 常驻（一直显示最新状态文本，拖拽摸头也不收）；
+       hover 只认悬停；auto 悬停或 Python 触发的短暂浮现。
+       图鉴/mini 下一律不显示 */
     if (bubbleMode === 'off' || GALLERY || miniMode || !statusText) {
       bubble.classList.toggle('on', false);
+      return;
+    }
+    if (bubbleMode === 'always') {
+      bubble.classList.toggle('on', true);
       return;
     }
     var hoverShow = hovering && !dragging && !petting;

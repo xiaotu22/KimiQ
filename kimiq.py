@@ -68,6 +68,7 @@ CONF = {
     "bubble": "auto",   # 气泡模式：auto 状态变化自动浮现 / hover 仅悬停 / off 关闭
     "bubble_pos": "top",# 气泡位置：top 球顶 / side 球旁
     "detail": True,     # 气泡详细状态：气泡里拼上 Kimi 正在做什么的实时文本
+    "task_bubble": True,# 任务气泡：状态气泡下面那条，专门显示当前任务（极简常驻）
     "autostart": False, # 开机自启（注册表 Run 项）
     "launch_kimi": True,# 启动 KimiQ 时若 Kimi CLI 没在跑，开个终端拉起它
 }
@@ -85,7 +86,7 @@ def load_conf():
         # 范围收紧后旧配置可能超界，夹紧
         CONF["size"] = max(SIZE_MIN, min(SIZE_MAX, int(CONF["size"])))
         # 旧配置没有/乱写的气泡项，回默认
-        if CONF["bubble"] not in ("auto", "hover", "off"):
+        if CONF["bubble"] not in ("auto", "always", "hover", "off"):
             CONF["bubble"] = "auto"
         if CONF["bubble_pos"] not in ("top", "side"):
             CONF["bubble_pos"] = "top"
@@ -131,12 +132,14 @@ MIN_DWELL_S = 1.2   # 状态最小停留秒数：hooks 连发时暂存去抖（�
 # 内心戏轮播：基础工作态停留过久就从表情池摇一个（含本体，可摇回），
 # 真实 hooks 事件到达立即重锚或打断——轮播只是"等待时的内心戏"，不抢戏
 VARIETY = {
-    "30": ["16", "03", "20", "37", "04"],   # 思考久了：专注/好奇/困惑/回忆/发呆
-    "40": ["37", "03"],                     # 翻资料久了：回忆/好奇
-    "32": ["16"],                           # 干活久了：转专注
-    "35": ["11", "18"],                     # 等输入久了：疑惑/无奈
+    "30": ["16", "03", "20", "37", "04", "11", "13"],   # 思考：专注/好奇/困惑/回忆/发呆/疑惑/惊讶
+    "40": ["37", "03", "16", "11", "13"],               # 翻资料：回忆/好奇/专注/疑惑/惊讶
+    "32": ["16", "03", "13", "11", "30", "17", "21"],   # 干活：专注/好奇/惊讶/疑惑/思考/慌张/红温（大幅度表情进轮询）
+    "36": ["03", "13"],                                 # 联网：好奇/惊讶
+    "35": ["11", "18", "17"],                           # 等输入：疑惑/无奈/慌张
 }
-VARIETY_AFTER_S = {"30": 6, "40": 5, "32": 7, "35": 8}   # 各基础态摇一次的停留间隔
+VARIETY_AFTER_S = {"30": 6, "40": 5, "32": 6, "36": 5, "35": 8}   # 各基础态摇一次的基准间隔
+VARIETY_JITTER = (-1.5, 2.5)   # 每次轮换间隔加随机抖动（3~8.5s 不等），更像活的
 
 TRANSIENT = {"01": 6, "05": 5}   # 过场表情（开机唤醒/勿扰解除）：到点没人接班自回 02
 
@@ -293,6 +296,9 @@ class Controller(QObject):
         self.pending = None              # 最小停留内暂存的状态（只留最新）
         self.base_id = None              # hooks 驱动的基础工作态（内心戏轮播的锚）
         self.variety_at = time.time()    # 上次轮播/真实事件/本地互动时刻
+        self.next_variety_in = 6         # 下次轮播间隔（每次轮换后带抖动重掷）
+        self.flash_until = 0             # 详情气泡存活期（期间 track 不回写纯状态文案）
+        self.baby_count = 0              # 子代理小球台账（0~2，mask 让位用）
         self.fail_streak = 0             # 连续失败计数（红温升级用）
         self.next_chatter = time.time() + 40   # 下次待命自言自语时刻
         self.self_talk_until = 0         # 自语表情保护期（期间空闲阶梯不顶回 02）
@@ -365,6 +371,7 @@ class Controller(QObject):
         self.last_switch = time.time()
         self.variety_at = self.last_switch
         self.base_id = emo_id if emo_id in VARIETY else None
+        self.next_variety_in = VARIETY_AFTER_S.get(self.base_id, 6)
         self._set_id(emo_id)
         if emo_id == "33":
             play_sound("done")      # 任务完成：彩带由表情 33 自带，这里补音效
@@ -373,8 +380,14 @@ class Controller(QObject):
                               lambda e=emo_id: self._transient_done(e))
         base = STATUS_TEXT.get(emo_id, "")
         if text and CONF.get("detail", True):
-            base = "%s · %s" % (base, text)
+            if CONF.get("task_bubble", True):
+                # 任务气泡：独立显示当前任务（与状态气泡解耦）
+                self._js_call("kqiu.setTask(%s)" % json.dumps(text))
+            else:
+                base = "%s · %s" % (base, text)   # 任务气泡关着，退回拼进状态气泡
         self._js_flash(base)
+        if emo_id in ("31", "33", "41"):   # 新任务/完成/打断：清掉任务气泡
+            self._js_call("kqiu.setTask('')")
 
     def _transient_done(self, emo_id):
         """过场表情到点：没人接班（还是它且没有工作锚）就回 02 待机"""
@@ -387,6 +400,7 @@ class Controller(QObject):
 
     def _js_flash(self, text, sec=2.5):
         """让气泡主动浮现几秒（页面按用户设置的模式自行决定是否真显示）"""
+        self.flash_until = time.time() + sec
         self._js_call("kqiu.flashBubble(%s, %s)" % (json.dumps(text), sec))
 
     def _apply_baby(self, op):
@@ -394,6 +408,10 @@ class Controller(QObject):
             return
         fn = "kqiu.addBaby()" if op == "add" else "kqiu.removeBaby()"
         self.view.page().runJavaScript(fn)
+        # 台账跟 JS 容量规则走（0~2），mask 要给趴在球下侧的小球让位
+        self.baby_count = (min(2, self.baby_count + 1) if op == "add"
+                           else max(0, self.baby_count - 1))
+        self.view._update_mask()
         self.touch()
 
     def set_dnd(self, on):
@@ -414,8 +432,11 @@ class Controller(QObject):
             return
         self.current_id = emo_id
         self.variety_at = time.time()   # 本地互动（摸头等）优先，轮播往后让
+        self.next_variety_in = VARIETY_AFTER_S.get(self.base_id, 6)
         self._track_work(emo_id)
-        self._js_status()
+        # 引擎 change 回报会晚于详情气泡到达，详情存活期内别用纯状态文案盖掉它
+        if time.time() > self.flash_until:
+            self._js_status()
 
     def _track_work(self, emo_id):
         # 连续工作计时：进入工作态开始计时，离开即清零
@@ -463,14 +484,17 @@ class Controller(QObject):
                     and now > self.self_talk_until):
                 self.base_id = None
                 self._set_id("02")
-        # 内心戏轮播：基础工作态停够久 → 从池里摇一个（含本体，可摇回）
+        # 内心戏轮播：基础工作态停够久 → 从池里摇一个（含本体，可摇回；间隔带抖动更像活的）
         elif self.base_id and not CONF.get("dnd"):
-            if now - self.variety_at >= VARIETY_AFTER_S[self.base_id]:
+            if now - self.variety_at >= self.next_variety_in:
                 pool = [p for p in [self.base_id] + VARIETY[self.base_id]
                         if p != cur]
                 if pool:
                     self.variety_at = now
                     self.last_switch = now
+                    lo, hi = VARIETY_JITTER
+                    self.next_variety_in = max(
+                        3.0, VARIETY_AFTER_S[self.base_id] + random.uniform(lo, hi))
                     pick = random.choice(pool)
                     self._set_id(pick, track=False)
                     self._js_flash(STATUS_TEXT.get(pick, ""))
@@ -503,6 +527,8 @@ class Controller(QObject):
             "kqiu.setBubbleMode(%s)" % json.dumps(CONF.get("bubble", "auto")))
         self.view.page().runJavaScript(
             "kqiu.setBubblePos(%s)" % json.dumps(CONF.get("bubble_pos", "top")))
+        self.view.page().runJavaScript(
+            "kqiu.setTaskBubble(%s)" % ("true" if CONF.get("task_bubble", True) else "false"))
         if self.pending_emotion:
             self._js_set(self.pending_emotion)
             self.pending_emotion = None
@@ -848,16 +874,27 @@ class BallWindow(QWebEngineView):
         cy = self.height() // 2
         r = int(self.ball_size * 0.72) + 8
         region = QRegion(QRect(cx - r, cy - r, r * 2, r * 2), QRegion.Ellipse)
-        # 气泡关闭时不留气泡条，命中区只剩球圆（少一块挡桌面的死区）
-        if not self.mini and w >= WIN_SIZE and CONF.get("bubble") != "off":
+        # 子代理小球趴在球的左下/右下侧（与 harness placeBabies 同坐标），留命中区
+        if not self.mini and w >= WIN_SIZE and self.ctrl.baby_count > 0:
+            by = cy + self.ball_size // 2 - 4
+            region = region.united(QRect(cx - self.ball_size // 2 - 32, by - 2, 30, 30))
+            if self.ctrl.baby_count > 1:
+                region = region.united(QRect(cx + self.ball_size // 2 + 2, by - 2, 30, 30))
+        # 气泡关闭且任务气泡也关时，不留气泡条（少一块挡桌面的死区）
+        if (not self.mini and w >= WIN_SIZE
+                and (CONF.get("bubble") != "off" or CONF.get("task_bubble", True))):
+            two = CONF.get("task_bubble", True)   # 双气泡要更高的条
             if CONF.get("bubble_pos") == "side":
                 # 气泡靠球右侧：留球右到窗边的横条
                 x0 = cx + self.ball_size // 2 - 4
-                region = region.united(QRect(x0, cy - 26, w - x0, 52))
+                region = region.united(QRect(x0, cy - 26, w - x0, 76 if two else 52))
             else:
-                # 气泡贴球顶上方（harness 里按球径算位置）：留出它那条区域
+                # 气泡贴球顶上方（两条叠放，harness 里按球径算位置）：留出它们那条区域
                 ball_top = cy - self.ball_size // 2
-                region = region.united(QRect(cx - 70, max(0, ball_top - 46), 140, 52))
+                if two:
+                    region = region.united(QRect(cx - 70, max(0, ball_top - 66), 140, 68))
+                else:
+                    region = region.united(QRect(cx - 70, max(0, ball_top - 46), 140, 52))
         self.setMask(region)
 
     def apply_ontop(self):
@@ -893,7 +930,8 @@ class BallWindow(QWebEngineView):
         sub = QMenu("气泡", m)
         grp = QActionGroup(sub)
         grp.setExclusive(True)
-        for label, val in [("自动浮现", "auto"), ("仅悬停显示", "hover"), ("关闭气泡", "off")]:
+        for label, val in [("自动浮现", "auto"), ("常驻显示", "always"),
+                           ("仅悬停显示", "hover"), ("关闭气泡", "off")]:
             a = QAction(label, sub, checkable=True)
             a.setChecked(CONF.get("bubble", "auto") == val)
             a.triggered.connect(lambda _c, v=val: self.set_bubble(v))
@@ -913,6 +951,10 @@ class BallWindow(QWebEngineView):
         act_detail.setChecked(CONF.get("detail", True))
         act_detail.toggled.connect(self.set_detail)
         sub.addAction(act_detail)
+        act_task = QAction("任务气泡（独立任务条）", sub, checkable=True)
+        act_task.setChecked(CONF.get("task_bubble", True))
+        act_task.toggled.connect(self.set_task_bubble)
+        sub.addAction(act_task)
         m.addAction(act_set)
         m.addAction(act_gallery)
         m.addAction(act_help)
@@ -942,6 +984,13 @@ class BallWindow(QWebEngineView):
         """气泡详细状态开关：关了就只显示写死的状态文案"""
         CONF["detail"] = bool(on)
         save_conf()
+
+    def set_task_bubble(self, on):
+        """任务气泡开关：状态气泡下面那条独立任务条"""
+        CONF["task_bubble"] = bool(on)
+        save_conf()
+        self.page().runJavaScript("kqiu.setTaskBubble(%s)" % ("true" if on else "false"))
+        self._update_mask()
 
     # ---------- mini 贴边隐藏 ----------
     def on_dropped(self):
