@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<!-- ============================================================
+  harness.html —— KimiQ桌宠壳内页（QWebEngineView 专用）
+  完整复用 sam70361/emotion-ball 引擎（vendor/ 原样加载），
+  本页只做：实例化主球、注视、拖拽/摸头/双击交互、gallery 图鉴模式，
+  并对 Python 暴露 window.kqiu 控制接口（经 runJavaScript 调用）。
+  表情数据与渲染版权归作者所有（见 vendor/emotion-ball/LICENSE）。
+============================================================ -->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: transparent; overflow: hidden;
+    user-select: none; -webkit-user-select: none;
+  }
+  #stage { width: 100vw; height: 100vh; cursor: grab; }
+  #stage.dragging { cursor: grabbing; }
+  /* gallery 图鉴模式的状态标签（默认隐藏） */
+  #label {
+    display: none; position: fixed; left: 8px; top: 6px;
+    font: 12px/1.5 "Microsoft YaHei", sans-serif; color: #555;
+    background: rgba(255, 255, 255, 0.82); border-radius: 8px; padding: 2px 10px;
+    pointer-events: none; white-space: nowrap;
+  }
+  body.gallery #label { display: block; }
+  /* 图鉴底部操作提示 */
+  #hint {
+    display: none; position: fixed; left: 50%; bottom: 8px;
+    transform: translateX(-50%);
+    font: 12px/1.5 "Microsoft YaHei", sans-serif; color: #666;
+    background: rgba(255, 255, 255, 0.82); border-radius: 8px; padding: 3px 12px;
+    pointer-events: none; white-space: nowrap;
+  }
+  body.gallery #hint { display: block; }
+  /* 悬停状态气泡：显示 Kimi 当前状态（由 Python 同步文本）。
+     小窗（120px）下限制宽度自动换行，最多两行，超出省略 */
+  #bubble {
+    display: none; position: fixed; left: 50%; top: 2px;
+    transform: translateX(-50%);
+    font: 11px/1.4 "Microsoft YaHei", sans-serif; color: #444;
+    background: rgba(255, 255, 255, 0.94); border-radius: 8px;
+    padding: 2px 8px; pointer-events: none;
+    max-width: 108px; text-align: center;
+    overflow: hidden; display: none; z-index: 10;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  }
+  #bubble.on { display: block; }
+  #bubble::after {   /* 气泡小尾巴 */
+    content: ""; position: absolute; left: 50%; bottom: -4px;
+    transform: translateX(-50%);
+    border: 4px solid transparent; border-top-color: rgba(255, 255, 255, 0.94);
+    border-bottom: none;
+  }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="label"></div>
+<div id="bubble"></div>
+<div id="hint">←/→ 或点两侧翻页 · 空格 停/启巡演 · 点中间甩彩带</div>
+
+<!-- Qt WebChannel 桥（拖拽移动窗口用，qrc 由 QtWebEngine 内置提供） -->
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<!-- 作者引擎：几何数据 → 表情数据 → 渲染层 → 驱动层（原样加载，不改动） -->
+<script src="vendor/emotion-ball/js/rings.js"></script>
+<script src="vendor/emotion-ball/js/emotions.js"></script>
+<script src="vendor/emotion-ball/js/ball.js"></script>
+<script src="vendor/emotion-ball/js/engine.js"></script>
+
+<script>
+(function () {
+  'use strict';
+
+  var GALLERY = location.hash.indexOf('gallery') >= 0;
+  if (GALLERY) document.body.classList.add('gallery');
+
+  /* ---------------- 主球实例（作者默认白球 blob，不改色不自绘） ---------------- */
+  var stage = document.getElementById('stage');
+  var label = document.getElementById('label');
+  var main = EmotionBall.create(stage, {
+    emotion: '02',
+    shape: 'blob',
+    /* 待机/休眠计时由 Python 侧按任务书第 5 节统一调度，引擎内建 idle 关闭 */
+    label: 'KimiQ'
+  });
+  window.EB_MAIN = main;
+
+  /* ---------------- Python 桥（QWebChannel，可选：纯浏览器调试时静默降级） ---------------- */
+  var bridge = null;
+  if (typeof qt !== 'undefined' && typeof QWebChannel !== 'undefined') {
+    new QWebChannel(qt.webChannelTransport, function (ch) {
+      bridge = ch.objects.kqiuBridge || null;
+    });
+  }
+
+  /* ---------------- 对 Python 的控制接口 ---------------- */
+  var ALL_IDS = EmotionBall.config.list().map(function (d) { return d.id; });
+
+  function updateLabel() {
+    if (!GALLERY || !main.emotionId) return;
+    var def = EmotionBall.config.get(main.emotionId);
+    var idx = ALL_IDS.indexOf(main.emotionId);
+    label.textContent = 'ID ' + def.id + ' · ' + def.name +
+      '（' + (idx + 1) + '/' + ALL_IDS.length + '）';
+  }
+  function onChange(e) {
+    updateLabel();
+    /* JS 侧自动切换（如 07 惊醒 → 自动落回 02）回报给 Python 保持台账一致 */
+    if (bridge) bridge.reportState(e.id);
+  }
+  main.on('change', onChange);
+
+  var miniMode = false;   /* 贴边隐藏中（Python 同步）：禁气泡 */
+  var sketchOn = false;   /* 线稿模式（设置里可开） */
+  var babies = [];        /* 子代理小球（Kimi 开子代理时召唤） */
+
+  window.kqiu = {
+    /* 切表情：返回是否成功（未知 id 引擎内部已兜底回 02，这里如实上报） */
+    set: function (id) {
+      id = String(id);
+      if (!EmotionBall.config.get(id)) return false;
+      stopTour();
+      return main.setEmotion(id);
+    },
+    /* 当前表情 id（Python 轮询/调试用） */
+    current: function () { return main.emotionId; },
+    /* 全部表情 id 列表 */
+    ids: function () { return ALL_IDS.slice(); },
+    spin: function (n) { main.spin(n || 1); },
+    /* Python 同步过来的 Kimi 当前状态文本（悬停气泡用） */
+    setStatus: function (text) {
+      statusText = String(text || '');
+      bubble.textContent = statusText;
+    },
+    /* 贴边隐藏模式开关（mini 时悬停气泡让位，交给 peek 探出） */
+    setMini: function (on) {
+      miniMode = !!on;
+      refreshBubble();
+    },
+    /* 气泡模式：auto 状态变化自动浮现 / hover 仅悬停 / off 关闭 */
+    setBubbleMode: function (m) {
+      bubbleMode = (m === 'auto' || m === 'off') ? m : 'hover';
+      refreshBubble();
+    },
+    /* 气泡位置：top 球顶 / side 球右侧（命中 mask 由 Python 侧同步） */
+    setBubblePos: function (p) {
+      bubblePos = (p === 'side') ? 'side' : 'top';
+      placeBubble();
+    },
+    /* 主动浮现气泡 sec 秒（是否真的显示由 refreshBubble 按模式裁决） */
+    flashBubble: function (text, sec) {
+      if (text) { statusText = String(text); bubble.textContent = statusText; }
+      flashOn = true;
+      clearTimeout(flashTimer);
+      flashTimer = setTimeout(function () {
+        flashOn = false;
+        refreshBubble();
+      }, (sec || 3) * 1000);
+      refreshBubble();
+    },
+    /* 球显示大小（窗口固定 320 不动，只缩放球体）。
+       基准：窗口 320px 时球自然直径 ≈ 282px（viewBox 259 宽，球占 228.45） */
+    setBallSize: function (px) {
+      stage.style.transform = 'scale(' + (px / 282) + ')';
+      stage.style.transformOrigin = 'center center';
+      ballPx = px;
+      placeBubble();
+    },
+    /* 换身体形状：blob 圆胖 / wedge 三角 / gem 菱形（引擎原生，需重建实例） */
+    setShape: function (shape) {
+      if (['blob', 'wedge', 'gem'].indexOf(shape) < 0) return false;
+      var cur = main.emotionId || '02';
+      main.destroy();
+      main = EmotionBall.create(stage, { emotion: cur, shape: shape, label: 'KimiQ' });
+      window.EB_MAIN = main;
+      main.on('change', onChange);
+      if (sketchOn) main.setStyle({ sketch: 1 });
+      return true;
+    },
+    /* 线稿模式开关 */
+    setSketch: function (on) {
+      sketchOn = !!on;
+      main.setStyle({ sketch: sketchOn ? 1 : 0 });
+    },
+    /* 子代理小球：最多 2 只，26px 缩在大球左/右上角外侧（别骑脸） */
+    addBaby: function () {
+      if (babies.length >= 2) return babies.length;
+      var el = document.createElement('div');
+      el.style.cssText = 'position:fixed;top:0;width:26px;height:26px;pointer-events:none;'
+        + (babies.length === 0 ? 'left:0;' : 'right:0;') + 'z-index:5';
+      document.body.appendChild(el);
+      var eng = EmotionBall.create(el, {
+        emotion: '32', lite: true, eyeScale: 1.7, label: 'Kimi 子代理'
+      });
+      babies.push({ el: el, eng: eng });
+      return babies.length;
+    },
+    removeBaby: function () {
+      var b = babies.pop();
+      if (b) { b.eng.destroy(); b.el.remove(); }
+      return babies.length;
+    }
+  };
+
+  /* ---------------- 悬停气泡 + 睡眠惊醒 + hover 上报（mini 探出用） ---------------- */
+  var bubble = document.getElementById('bubble');
+  var statusText = 'Kimi：待命中';
+  var hovering = false;
+  var ballPx = 120;   /* 与 Python CONF 默认 size 一致，apply_size 后同步 */
+  var bubbleMode = 'hover';   /* 页面加载后由 Python 同步为设置值 */
+  var bubblePos = 'top';
+  var flashOn = false, flashTimer = 0;
+
+  /* 气泡贴球：top=球顶上方（34≈两行气泡高+小尾巴+间隙，大球贴不下退到窗口顶）；
+     side=球右侧垂直居中，宽度随剩余空间收窄 */
+  function placeBubble() {
+    if (bubblePos === 'side') {
+      var left = 160 + ballPx / 2 + 8;
+      bubble.style.left = left + 'px';
+      bubble.style.top = '146px';
+      bubble.style.transform = 'none';
+      bubble.style.maxWidth = Math.max(56, 320 - left - 6) + 'px';
+    } else {
+      bubble.style.left = '50%';
+      bubble.style.transform = 'translateX(-50%)';
+      bubble.style.maxWidth = '108px';
+      var ballTop = (320 - ballPx) / 2;
+      bubble.style.top = Math.max(2, ballTop - 34) + 'px';
+    }
+  }
+  placeBubble();
+
+  function refreshBubble() {
+    /* off 永不显示；hover 只认悬停；auto 悬停或 Python 触发的短暂浮现都算。
+       拖拽/摸头/图鉴/mini 下一律不显示 */
+    if (bubbleMode === 'off' || GALLERY || miniMode || !statusText) {
+      bubble.classList.toggle('on', false);
+      return;
+    }
+    var hoverShow = hovering && !dragging && !petting;
+    bubble.classList.toggle('on', bubbleMode === 'auto' ? (hoverShow || flashOn) : hoverShow);
+  }
+  stage.addEventListener('pointerenter', function () {
+    hovering = true;
+    refreshBubble();
+    if (bridge) bridge.notify('hover_in');
+    /* 睡眠惊醒：睡着/休眠时被鼠标碰到 → 07 抖动唤醒（引擎自动落回 02） */
+    if (!GALLERY && (main.emotionId === '00' || main.emotionId === '06')) {
+      main.setEmotion('07');
+      if (bridge) bridge.notify('wake');
+    }
+  });
+  stage.addEventListener('pointerleave', function () {
+    hovering = false;
+    refreshBubble();
+    if (bridge) bridge.notify('hover_out');
+  });
+
+  /* ---------------- 鼠标注视（同作者 app.js 的做法） ---------------- */
+  function clamp06(v) { return v < -0.6 ? -0.6 : (v > 0.6 ? 0.6 : v); }
+  window.addEventListener('pointermove', function (e) {
+    var r = stage.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    main.setGaze(
+      clamp06((e.clientX - (r.left + r.width / 2)) / r.width) / 0.6,
+      clamp06((e.clientY - (r.top + r.height / 2)) / r.height) / 0.6
+    );
+  }, { passive: true });
+  document.addEventListener('pointerleave', function () { main.clearGaze(); });
+
+  /* ---------------- 交互：拖拽移动窗口 / 摸头害羞 / 单击彩带 / 双击满意 ----------------
+   * 判定规则：按住位移 >6px = 拖拽（通知 Python 移窗口）；
+   *           按住不动 >350ms = 摸头（14 害羞，松开回 02）；
+   *           短按松开 = 单击（甩一圈彩带）；双击 = 19 满意。 */
+  var down = false, dragging = false, petting = false;
+  var downX = 0, downY = 0, petTimer = 0;
+
+  stage.addEventListener('pointerdown', function (e) {
+    if (e.button !== 0) return;
+    down = true; dragging = false; petting = false;
+    downX = e.screenX; downY = e.screenY;
+    try { stage.setPointerCapture(e.pointerId); } catch (err) { /* 已释放 */ }
+    clearTimeout(petTimer);
+    petTimer = setTimeout(function () {
+      if (down && !dragging) {
+        petting = true;
+        stopTour();
+        main.setEmotion('14');          /* 摸头 → 害羞 */
+        if (bridge) bridge.notify('pet');
+        refreshBubble();
+      }
+    }, 350);
+  });
+
+  stage.addEventListener('pointermove', function (e) {
+    if (!down) return;
+    if (!dragging && Math.hypot(e.screenX - downX, e.screenY - downY) > 6) {
+      dragging = true;
+      clearTimeout(petTimer);
+      stage.classList.add('dragging');
+      if (bridge) bridge.dragStart(downX, downY);   /* 用按下时的坐标算偏移，否则位移恒为 0 */
+      refreshBubble();
+    }
+    if (dragging && bridge) bridge.dragMove(e.screenX, e.screenY);
+  });
+
+  function endPointer(applyPet) {
+    if (!down) return;
+    down = false;
+    clearTimeout(petTimer);
+    stage.classList.remove('dragging');
+    if (dragging) {
+      dragging = false;
+      if (bridge) bridge.dragEnd();
+    } else if (petting) {
+      petting = false;
+      lastPetEnd = performance.now();     /* 摸头刚结束，接下来别误判双击 */
+      if (applyPet) main.setEmotion('02');   /* 松开摸头 → 回待机 */
+    }
+    refreshBubble();
+  }
+  stage.addEventListener('pointerup', function (e) {
+    var wasTap = down && !dragging && !petting;
+    endPointer(true);
+    /* 图鉴模式翻页优先，彩带只在中间区域 */
+    if (wasTap && !GALLERY) main.spin(1);
+    if (wasTap && GALLERY && e.clientX / stage.clientWidth > 0.34
+        && e.clientX / stage.clientWidth < 0.66) main.spin(1);
+  });
+  stage.addEventListener('pointercancel', function () { endPointer(false); });
+
+  /* 右键 → 通知 Python 弹菜单（退出） */
+  stage.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+    if (bridge) bridge.menu(e.screenX, e.screenY);
+  });
+
+  /* 双击 → 满意彩蛋，几秒后自动回待机（不常驻），摸头后 600ms 内不判双击 */
+  var lastPetEnd = 0, eggTimer = 0;
+  stage.addEventListener('dblclick', function () {
+    if (performance.now() - lastPetEnd < 600) return;
+    stopTour();
+    main.setEmotion('19');
+    if (bridge) bridge.notify('pat');
+    clearTimeout(eggTimer);
+    eggTimer = setTimeout(function () {
+      if (main.emotionId === '19') main.setEmotion('02');
+    }, 4000);
+  });
+
+  /* ---------------- gallery 图鉴模式：自动巡演 + 方向键手动翻页 ---------------- */
+  function stopTour() { if (main.touring) main.stopTour(); }
+  function step(delta) {
+    stopTour();
+    var idx = ALL_IDS.indexOf(main.emotionId);
+    var next = idx < 0 ? 0 : (idx + delta + ALL_IDS.length) % ALL_IDS.length;
+    main.setEmotion(ALL_IDS[next]);
+  }
+  if (GALLERY) {
+    main.startTour(ALL_IDS, 2500);
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'ArrowLeft') { step(-1); e.preventDefault(); }
+      else if (e.key === 'ArrowRight') { step(1); e.preventDefault(); }
+      else if (e.key === ' ') {             /* 空格切换自动巡演 */
+        if (main.touring) stopTour();
+        else main.startTour(ALL_IDS, 2500);
+        e.preventDefault();
+      }
+    });
+    /* 图鉴点击翻页：点左 1/3 上一个、右 1/3 下一个、中间甩彩带 */
+    stage.addEventListener('click', function (e) {
+      var x = e.clientX / stage.clientWidth;
+      if (x < 0.34) step(-1);
+      else if (x > 0.66) step(1);
+      /* 中间区域的单击由 tap 逻辑甩彩带 */
+    });
+    updateLabel();
+  }
+})();
+</script>
+</body>
+</html>
